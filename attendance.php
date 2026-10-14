@@ -1,28 +1,27 @@
+
 <?php
-
 require_once __DIR__ . "/includes/auth.php";
-requireRole(["employee"]);
-
 require_once __DIR__ . "/config/database.php";
 
-// Generate CSRF token.
+requireLogin();
+
 if (empty($_SESSION["csrf_token"])) {
     $_SESSION["csrf_token"] = bin2hex(random_bytes(32));
 }
 
-function h($value): string
+function attendancePageH($value): string
 {
-    return htmlspecialchars(
-        (string) ($value ?? ""),
-        ENT_QUOTES,
-        "UTF-8"
-    );
+    return htmlspecialchars((string) $value, ENT_QUOTES, "UTF-8");
 }
 
-$userId = (int) $_SESSION["user_id"];
-$error = "";
+$message = "";
+$messageType = "";
 
-// Get the active employee linked to the logged-in account.
+$userId = (int) $_SESSION["user_id"];
+
+/*
+ * Find the active employee linked to the logged-in user.
+ */
 $stmt = $pdo->prepare("
     SELECT
         e.id,
@@ -37,39 +36,44 @@ $stmt = $pdo->prepare("
     LIMIT 1
 ");
 
-$stmt->execute(["user_id" => $userId]);
+$stmt->execute([":user_id" => $userId]);
 $employee = $stmt->fetch(PDO::FETCH_ASSOC);
 
 if (!$employee) {
     http_response_code(403);
-    exit("Your account is not linked to an active employee. Contact HR.");
+    exit(
+        "No active employee profile is linked to your account. "
+        . "Please contact the administrator."
+    );
 }
 
 $employeeId = (int) $employee["id"];
 
-// Process clock-in or clock-out submissions.
+/*
+ * Process clock-in or clock-out.
+ */
 if ($_SERVER["REQUEST_METHOD"] === "POST") {
-
-    $token = $_POST["csrf_token"] ?? "";
+    $submittedToken = $_POST["csrf_token"] ?? "";
     $action = $_POST["action"] ?? "";
 
     if (
-        !is_string($token) ||
-        !hash_equals($_SESSION["csrf_token"], $token)
+        !is_string($submittedToken)
+        || !hash_equals($_SESSION["csrf_token"], $submittedToken)
     ) {
-        $error = "Invalid form token. Refresh the page and try again.";
-
+        $message = "Your session token is invalid. Refresh the page and try again.";
+        $messageType = "error";
     } elseif (!in_array($action, ["clock_in", "clock_out"], true)) {
-        $error = "Invalid attendance action.";
-
+        $message = "Invalid attendance action.";
+        $messageType = "error";
     } else {
-
         try {
             $pdo->beginTransaction();
 
-            // Lock the employee row to reduce the risk of
-            // simultaneous duplicate attendance submissions.
-            $lockEmployee = $pdo->prepare("
+            /*
+             * Lock the employee row to help prevent two simultaneous
+             * attendance requests for the same employee.
+             */
+            $lockStmt = $pdo->prepare("
                 SELECT id
                 FROM employees
                 WHERE id = :employee_id
@@ -77,57 +81,64 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
                 FOR UPDATE
             ");
 
-            $lockEmployee->execute([
-                "employee_id" => $employeeId
-            ]);
+            $lockStmt->execute([":employee_id" => $employeeId]);
 
-            if (!$lockEmployee->fetch()) {
+            if (!$lockStmt->fetch(PDO::FETCH_ASSOC)) {
                 throw new RuntimeException(
-                    "Your employee record is no longer active."
+                    "Your employee profile is no longer active."
                 );
             }
 
-            // Find the most recent accepted attendance event.
-            $latest = $pdo->prepare("
+            /*
+             * IMPORTANT:
+             * Check the latest accepted event across all dates,
+             * not just today's events.
+             *
+             * This allows a clock-in on one date to be closed by
+             * a clock-out on the following date.
+             */
+            $lastStmt = $pdo->prepare("
                 SELECT id, event_type, recorded_at
                 FROM attendance_events
                 WHERE employee_id = :employee_id
                   AND event_status = 'accepted'
                 ORDER BY recorded_at DESC, id DESC
                 LIMIT 1
+                FOR UPDATE
             ");
 
-            $latest->execute([
-                "employee_id" => $employeeId
-            ]);
+            $lastStmt->execute([":employee_id" => $employeeId]);
+            $lastEvent = $lastStmt->fetch(PDO::FETCH_ASSOC);
 
-            $lastEvent = $latest->fetch(PDO::FETCH_ASSOC);
-
-            // Determine whether the requested action is valid.
             if (
-                $action === "clock_in" &&
-                $lastEvent &&
-                $lastEvent["event_type"] === "clock_in"
+                $action === "clock_in"
+                && $lastEvent
+                && $lastEvent["event_type"] === "clock_in"
             ) {
                 throw new RuntimeException(
-                    "You are already clocked in. Please clock out first."
+                    "You are already clocked in. Please clock out before starting another attendance session."
                 );
             }
 
             if (
-                $action === "clock_out" &&
-                (
-                    !$lastEvent ||
-                    $lastEvent["event_type"] !== "clock_in"
+                $action === "clock_out"
+                && (
+                    !$lastEvent
+                    || $lastEvent["event_type"] !== "clock_in"
                 )
             ) {
                 throw new RuntimeException(
-                    "You must clock in before you can clock out."
+                    "You do not have an open clock-in. Please clock in first."
                 );
             }
 
-            // Record the attendance event using the database server time.
-            $insert = $pdo->prepare("
+            /*
+             * Record the current date and time using the server's
+             * configured timezone.
+             */
+            $recordedAt = date("Y-m-d H:i:s");
+
+            $insertStmt = $pdo->prepare("
                 INSERT INTO attendance_events (
                     employee_id,
                     event_type,
@@ -137,49 +148,47 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
                 ) VALUES (
                     :employee_id,
                     :event_type,
-                    NOW(),
+                    :recorded_at,
                     'simulated',
                     'accepted'
                 )
             ");
 
-            $insert->execute([
-                "employee_id" => $employeeId,
-                "event_type" => $action
+            $insertStmt->execute([
+                ":employee_id" => $employeeId,
+                ":event_type" => $action,
+                ":recorded_at" => $recordedAt
             ]);
 
             $pdo->commit();
 
-            // Redirect to prevent accidental resubmission.
-            header(
-                "Location: attendance.php?message=" .
-                urlencode($action)
-            );
-            exit;
+            $message = $action === "clock_in"
+                ? "Clock-in recorded successfully at " . $recordedAt . "."
+                : "Clock-out recorded successfully at " . $recordedAt . ".";
 
-        } catch (RuntimeException $e) {
+            $messageType = "success";
 
+        } catch (Throwable $e) {
             if ($pdo->inTransaction()) {
                 $pdo->rollBack();
             }
 
-            $error = $e->getMessage();
-
-        } catch (PDOException $e) {
-
-            if ($pdo->inTransaction()) {
-                $pdo->rollBack();
+            if ($e instanceof RuntimeException) {
+                $message = $e->getMessage();
+            } else {
+                error_log("Attendance error: " . $e->getMessage());
+                $message = "Unable to record attendance. Please try again or contact the administrator.";
             }
 
-            error_log($e->getMessage());
-
-            $error = "Attendance could not be recorded. Please try again.";
+            $messageType = "error";
         }
     }
 }
 
-// Read the latest accepted event to determine the current state.
-$latest = $pdo->prepare("
+/*
+ * Get the latest accepted event again to determine the current state.
+ */
+$stateStmt = $pdo->prepare("
     SELECT event_type, recorded_at
     FROM attendance_events
     WHERE employee_id = :employee_id
@@ -188,207 +197,205 @@ $latest = $pdo->prepare("
     LIMIT 1
 ");
 
-$latest->execute([
-    "employee_id" => $employeeId
-]);
-
-$lastEvent = $latest->fetch(PDO::FETCH_ASSOC);
+$stateStmt->execute([":employee_id" => $employeeId]);
+$lastEvent = $stateStmt->fetch(PDO::FETCH_ASSOC);
 
 $isClockedIn = (
-    $lastEvent &&
-    $lastEvent["event_type"] === "clock_in"
+    $lastEvent
+    && $lastEvent["event_type"] === "clock_in"
 );
 
-// Get the employee's recent attendance events.
-$history = $pdo->prepare("
-    SELECT event_type, recorded_at, event_status
+/*
+ * Show the latest attendance records.
+ */
+$historyStmt = $pdo->prepare("
+    SELECT event_type, recorded_at
     FROM attendance_events
     WHERE employee_id = :employee_id
     ORDER BY recorded_at DESC, id DESC
-    LIMIT 20
+    LIMIT 10
 ");
 
-$history->execute([
-    "employee_id" => $employeeId
-]);
-
-$attendanceRecords = $history->fetchAll(PDO::FETCH_ASSOC);
-
-// Display a success message after redirect.
-$message = $_GET["message"] ?? "";
-$success = "";
-
-if ($message === "clock_in") {
-    $success = "You have successfully clocked in.";
-} elseif ($message === "clock_out") {
-    $success = "You have successfully clocked out.";
-}
-
+$historyStmt->execute([":employee_id" => $employeeId]);
+$history = $historyStmt->fetchAll(PDO::FETCH_ASSOC);
 ?>
 
 <!DOCTYPE html>
 <html lang="en">
-
 <head>
     <meta charset="UTF-8">
-
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-
     <title>My Attendance</title>
-
     <link rel="stylesheet" href="assets/style.css">
+
+    <style>
+        .attendance-panel {
+            max-width: 800px;
+            margin: 25px auto;
+            padding: 24px;
+            background: #fff;
+            border: 1px solid #ddd;
+            border-radius: 10px;
+        }
+
+        .attendance-message {
+            padding: 12px;
+            margin: 15px 0;
+            border-radius: 5px;
+        }
+
+        .attendance-message.success {
+            background: #e8f7e9;
+            color: #185c25;
+        }
+
+        .attendance-message.error {
+            background: #fdeaea;
+            color: #8a1f1f;
+        }
+
+        .attendance-actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 12px;
+            margin: 20px 0;
+        }
+
+        .attendance-actions button {
+            padding: 12px 20px;
+            cursor: pointer;
+        }
+
+        .attendance-table-wrapper {
+            overflow-x: auto;
+        }
+
+        .attendance-table-wrapper table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        .attendance-table-wrapper th,
+        .attendance-table-wrapper td {
+            padding: 10px;
+            border: 1px solid #ddd;
+            text-align: left;
+        }
+    </style>
 </head>
 
 <body>
+<div class="container">
+    <div class="attendance-panel">
+        <h1>My Attendance</h1>
 
-<main class="container">
-
-    <h1>My Attendance</h1>
-
-    <p>
-        Welcome,
-        <strong>
-            <?= h($employee["first_name"] . " " . $employee["last_name"]) ?>
-        </strong>
-    </p>
-
-    <p>
-        Employee Number:
-        <strong><?= h($employee["employee_number"]) ?></strong>
-    </p>
-
-    <?php if ($error !== ""): ?>
-        <p class="error">
-            <?= h($error) ?>
+        <p>
+            Welcome,
+            <strong>
+                <?= attendancePageH(
+                    $employee["first_name"] . " " . $employee["last_name"]
+                ) ?>
+            </strong>
         </p>
-    <?php endif; ?>
 
-    <?php if ($success !== ""): ?>
-        <p class="success">
-            <?= h($success) ?>
+        <p>
+            Employee number:
+            <strong><?= attendancePageH($employee["employee_number"]) ?></strong>
         </p>
-    <?php endif; ?>
 
-    <section class="card">
-
-        <h2>Attendance Status</h2>
-
-        <?php if ($isClockedIn): ?>
-
-            <p>
-                Current status:
-                <strong>Clocked In</strong>
-            </p>
-
-            <p>
-                Clock-in time:
-                <?= h($lastEvent["recorded_at"]) ?>
-            </p>
-
-            <form method="POST" action="attendance.php">
-
-                <input
-                    type="hidden"
-                    name="csrf_token"
-                    value="<?= h($_SESSION["csrf_token"]) ?>"
-                >
-
-                <button
-                    type="submit"
-                    name="action"
-                    value="clock_out"
-                >
-                    Clock Out
-                </button>
-
-            </form>
-
-        <?php else: ?>
-
-            <p>
-                Current status:
-                <strong>Clocked Out</strong>
-            </p>
-
-            <form method="POST" action="attendance.php">
-
-                <input
-                    type="hidden"
-                    name="csrf_token"
-                    value="<?= h($_SESSION["csrf_token"]) ?>"
-                >
-
-                <button
-                    type="submit"
-                    name="action"
-                    value="clock_in"
-                >
-                    Clock In
-                </button>
-
-            </form>
-
+        <?php if ($message !== ""): ?>
+            <div class="attendance-message <?= attendancePageH($messageType) ?>">
+                <?= attendancePageH($message) ?>
+            </div>
         <?php endif; ?>
 
-    </section>
+        <h2>Current Status</h2>
 
-    <section>
-
-        <h2>Recent Attendance History</h2>
-
-        <?php if (empty($attendanceRecords)): ?>
-
-            <p>You have no attendance records yet.</p>
-
+        <?php if ($isClockedIn): ?>
+            <p>
+                Status: <strong>Clocked in</strong>
+            </p>
+            <p>
+                Clock-in time:
+                <?= attendancePageH($lastEvent["recorded_at"]) ?>
+            </p>
         <?php else: ?>
+            <p>Status: <strong>Not clocked in</strong></p>
+        <?php endif; ?>
 
+        <div class="attendance-actions">
+            <form method="POST">
+                <input
+                    type="hidden"
+                    name="csrf_token"
+                    value="<?= attendancePageH($_SESSION["csrf_token"]) ?>"
+                >
+
+                <input type="hidden" name="action" value="clock_in">
+
+                <button type="submit" <?= $isClockedIn ? "disabled" : "" ?>>
+                    Clock In
+                </button>
+            </form>
+
+            <form method="POST">
+                <input
+                    type="hidden"
+                    name="csrf_token"
+                    value="<?= attendancePageH($_SESSION["csrf_token"]) ?>"
+                >
+
+                <input type="hidden" name="action" value="clock_out">
+
+                <button type="submit" <?= !$isClockedIn ? "disabled" : "" ?>>
+                    Clock Out
+                </button>
+            </form>
+        </div>
+
+        <p>
+            You can clock out the following day if your shift continues
+            past midnight.
+        </p>
+
+        <h2>Recent Attendance Events</h2>
+
+        <div class="attendance-table-wrapper">
             <table>
-
                 <thead>
                     <tr>
-                        <th>Date and Time</th>
                         <th>Event</th>
-                        <th>Status</th>
+                        <th>Date and Time</th>
                     </tr>
                 </thead>
 
                 <tbody>
-
-                    <?php foreach ($attendanceRecords as $record): ?>
-
+                    <?php if (empty($history)): ?>
                         <tr>
-                            <td>
-                                <?= h($record["recorded_at"]) ?>
-                            </td>
-
-                            <td>
-                                <?= h(
-                                    $record["event_type"] === "clock_in"
-                                        ? "Clock In"
-                                        : "Clock Out"
-                                ) ?>
-                            </td>
-
-                            <td>
-                                <?= h(ucfirst($record["event_status"])) ?>
-                            </td>
+                            <td colspan="2">No attendance records yet.</td>
                         </tr>
-
-                    <?php endforeach; ?>
-
+                    <?php else: ?>
+                        <?php foreach ($history as $event): ?>
+                            <tr>
+                                <td>
+                                    <?= attendancePageH(
+                                        $event["event_type"] === "clock_in"
+                                            ? "Clock In"
+                                            : "Clock Out"
+                                    ) ?>
+                                </td>
+                                <td>
+                                    <?= attendancePageH($event["recorded_at"]) ?>
+                                </td>
+                            </tr>
+                        <?php endforeach; ?>
+                    <?php endif; ?>
                 </tbody>
-
             </table>
+        </div>
 
-        <?php endif; ?>
-
-    </section>
-
-    <p>
-        <a href="dashboard.php">Back to Dashboard</a>
-    </p>
-
-</main>
-
+        <p><a href="dashboard.php">Back to Dashboard</a></p>
+    </div>
+</div>
 </body>
 </html>

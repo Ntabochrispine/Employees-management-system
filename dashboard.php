@@ -40,16 +40,24 @@ $role = $_SESSION["role"];
     <?php if (in_array($role, ["admin", "hr"], true)): ?>
         <p><a href="employees.php">View employee records</a></p>
         <p><a href="add_employee.php">Register an employee</a></p>
-        <p><a href="attendance_kiosk.php">Attendance Terminal</a></p>
+        <!-- <p><a href="attendance_kiosk.php">Attendance Terminal</a></p> -->
+        <p><a href="attendance_report.php">Attendance reports</a></p>
+        <p><a href="attendance_corrections.php">Attendance corrections</a></p>
+        <p><a href="attendance_audit.php">Attendance audit history</a></p>
+        <p><a href="attendance_summary.php">Attendance summary</a></p>
+        <p><a href="timesheets.php">Working Hours &amp; Timesheets</a></p>
+        <p><a href="manage_shifts.php">Manage Shifts</a></p>
+        <p><a href="assign_shifts.php">Assign Shifts</a></p>
         <p><a href="request_leave.php">Request Leave</a></p>
         <p><a href="manage_leave.php">Manage Leave Requests</a></p>
+        <p><a href="manage_users.php">Manage Users</a></p>
         <p><a href="leave_history.php">My Leave History</a></p>
 
 
     <?php endif; ?>
 
     <?php if (in_array($role, ["admin", "hr", "supervisor"], true)): ?>
-        <p><a href="attendance_reports.php">Attendance reports (next module)</a></p>
+        <p><a href="attendance_report.php">Attendance reports</a></p>
         <p><a href="timesheets.php">Working Hours &amp; Timesheets</a></p>
         <p><a href="leave_history.php">My Leave History</a></p>
 
